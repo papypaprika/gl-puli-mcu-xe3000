@@ -4,12 +4,16 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt release version (e.g. 25.12.3)'
+        required: false
+        default: '25.12.3'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # OpenWrt 25.12 SDK for mediatek/filogic (aarch64_cortex-a53)
-  SDK_URL: https://downloads.openwrt.org/releases/25.12.0/targets/mediatek/filogic
-  SDK_NAME: openwrt-sdk-25.12.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.3' }}
+  OPENWRT_TARGET: mediatek/filogic
 
 jobs:
   build:
@@ -31,11 +35,37 @@ jobs:
             rsync unzip zlib1g-dev file wget \
             xz-utils zstd
 
-      - name: Download OpenWrt SDK
+      - name: Discover and download OpenWrt SDK
         run: |
-          wget -q "${SDK_URL}/${SDK_NAME}.tar.zst"
-          tar --use-compress-program=zstd -xf "${SDK_NAME}.tar.zst"
-          mv "${SDK_NAME}" sdk
+          TARGET_PATH=$(echo "$OPENWRT_TARGET" | tr '/' '/')
+          BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${OPENWRT_TARGET}"
+
+          echo "Fetching SDK filename from: ${BASE_URL}/"
+          SDK_NAME=$(wget -qO- "${BASE_URL}/sha256sums" \
+            | grep -oP 'openwrt-sdk-[^\s]+\.tar\.zst' \
+            | head -1)
+
+          if [ -z "$SDK_NAME" ]; then
+            echo "ERROR: Could not find SDK filename at ${BASE_URL}/sha256sums"
+            echo "Available files:"
+            wget -qO- "${BASE_URL}/sha256sums" | head -20
+            exit 1
+          fi
+
+          echo "Found SDK: ${SDK_NAME}"
+          echo "SDK_NAME=${SDK_NAME}" >> $GITHUB_ENV
+          echo "SDK_URL=${BASE_URL}/${SDK_NAME}" >> $GITHUB_ENV
+
+          wget -q --show-progress "${BASE_URL}/${SDK_NAME}"
+
+      - name: Extract SDK
+        run: |
+          echo "Extracting ${SDK_NAME}..."
+          tar --use-compress-program=zstd -xf "${SDK_NAME}"
+          # SDK extracts to a dir matching the archive name minus .tar.zst
+          SDK_DIR="${SDK_NAME%.tar.zst}"
+          echo "SDK_DIR=${SDK_DIR}" >> $GITHUB_ENV
+          mv "${SDK_DIR}" sdk
 
       - name: Install package source into SDK
         run: |
@@ -45,9 +75,7 @@ jobs:
       - name: Configure SDK for XE3000
         run: |
           cd sdk
-          # Start from SDK defaults
           make defconfig
-          # Enable the package, selecting XE3000 target
           cat >> .config << 'EOF'
           CONFIG_PACKAGE_gl-puli-mcu=y
           CONFIG_GL_PULI_MCU_XE3000=y
@@ -75,8 +103,8 @@ jobs:
         if: success()
         run: |
           mkdir -p output
-          find sdk/bin/ -name "gl-puli-mcu*.apk" -exec cp {} output/ \;
-          find sdk/bin/ -name "gl-puli-mcu*.ipk" -exec cp {} output/ \;
+          find sdk/bin/ \( -name "gl-puli-mcu*.apk" -o -name "gl-puli-mcu*.ipk" \) \
+            -exec cp {} output/ \;
           echo "=== Built packages ==="
           ls -lh output/
 
@@ -84,7 +112,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: gl-puli-mcu-xe3000-${{ github.sha }}
+          name: gl-puli-mcu-xe3000-${{ env.OPENWRT_VERSION }}-${{ github.sha }}
           path: output/
           retention-days: 30
 
